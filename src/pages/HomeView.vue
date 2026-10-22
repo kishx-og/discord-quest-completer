@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, useTemplateRef, shallowRef, provide, nextTick, triggerRef } from 'vue';
+import { ref, computed, useTemplateRef, shallowRef, provide, nextTick, triggerRef, onUnmounted } from 'vue';
 // import gameListData from '../assets/gamelist.json';
 import { onClickOutside, refDebounced, tryOnMounted } from '@vueuse/core';
 import { useFuse } from '@vueuse/integrations/useFuse'
@@ -9,7 +9,7 @@ import { GameActionsProvider, GameExecutable, type Game } from '@/types/types';
 import IconVerified from '@/components/IconVerified.vue';
 import { isEmpty } from 'lodash-es';
 import GameExecutables from '@/components/GameExecutables.vue';
-import { GameActionsKey } from '@/constants/constants';
+import { GameActionsKey, getCurrentOS } from '@/constants/constants';
 import { path } from '@tauri-apps/api';
 import { emit } from '@tauri-apps/api/event';
 import { useFetchGameList } from '@/composables/fetch-gamelist';
@@ -376,6 +376,110 @@ function hideDialog() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// Game Badge rotation
+// Cycles through games one by one (create dummy -> play -> wait -> stop -> next)
+// so Discord's "Game Variety" badge sees many different detectable games.
+// ---------------------------------------------------------------------------
+const BADGE_MIN_GAMES = 6;
+const isBadgeRotating = ref(false);
+const badgeMinutesPerGame = ref(5);
+const badgeCurrentGame = ref<string | null>(null);
+const badgePlayedCount = ref(0);
+let badgeAbort = false;
+
+function toLaunchExecutable(exe: GameExecutable): GameExecutable | null {
+    const parts = exe.name.split(/\\|\//);
+    const filename = parts[parts.length - 1];
+    if (!filename) return null;
+    const illegal = ['>', '<', ':', '"', '|', '?', '*'];
+    if (illegal.some(c => exe.name.includes(c))) return null;
+    return {
+        ...exe,
+        path: parts.slice(0, -1).join('/'),
+        segments: parts.length,
+        filename,
+    };
+}
+
+function pickExecutable(game: Game): GameExecutable | null {
+    const os = getCurrentOS();
+    const candidates = game.executables
+        .filter(e => !e.is_launcher)
+        .map(toLaunchExecutable)
+        .filter((e): e is GameExecutable => e !== null);
+    return candidates.find(e => e.os === os) ?? candidates[0] ?? null;
+}
+
+function shuffle<T>(arr: T[]): T[] {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+function fillBadgeGames() {
+    if (gameList.value.length >= BADGE_MIN_GAMES) return;
+    const have = new Set(gameList.value.map(g => g.id));
+    const pool = shuffle(gameDB.value.filter(g => !have.has(g.id) && pickExecutable(g)));
+    for (const g of pool) {
+        if (gameList.value.length >= BADGE_MIN_GAMES) break;
+        gameList.value.push({ uid: randomString(), ...g });
+    }
+}
+
+async function badgeWait(ms: number) {
+    const end = Date.now() + ms;
+    while (!badgeAbort && Date.now() < end) {
+        await new Promise(r => setTimeout(r, 1000));
+    }
+}
+
+async function startBadgeRotation() {
+    if (isBadgeRotating.value) return;
+    fillBadgeGames();
+    if (gameList.value.length === 0) {
+        showDialog('no_game_selected');
+        return;
+    }
+    isBadgeRotating.value = true;
+    badgeAbort = false;
+    badgePlayedCount.value = 0;
+    addLog('info', 'Game Badge rotation started');
+
+    while (!badgeAbort) {
+        for (const game of shuffle(gameList.value)) {
+            if (badgeAbort) break;
+            const executable = pickExecutable(game);
+            if (!executable) continue;
+            try {
+                badgeCurrentGame.value = game.name;
+                const ok = await createDummyGame(game, executable);
+                if (!ok) continue;
+                await playGame({ game, executable });
+                await badgeWait(Math.max(1, badgeMinutesPerGame.value) * 60_000);
+                badgePlayedCount.value++;
+            } catch (e) {
+                addLog('error', `Badge rotation failed for ${game.name}: ${e}`);
+            } finally {
+                await stopPlaying({ game, executable });
+            }
+        }
+    }
+    badgeCurrentGame.value = null;
+    isBadgeRotating.value = false;
+    addLog('info', 'Game Badge rotation stopped');
+}
+
+function stopBadgeRotation() {
+    badgeAbort = true;
+}
+
+onUnmounted(() => { badgeAbort = true; });
+
 provide<GameActionsProvider>(GameActionsKey, {
     canPlayGame,
     isGameInstalled,
@@ -640,6 +744,28 @@ provide<GameActionsProvider>(GameActionsKey, {
                         class="w-full py-2 rounded-lg bg-gray-600 hover:bg-gray-700 text-white">
                         {{ isConnecting || isConnectedToRPC ? 'Disconnect to Discord Gateway' : 'Test RPC' }}
                     </button>
+
+                    <!-- Game Badge: rotate through many games to level up the Game Variety badge -->
+                    <div class="p-3 border border-gray-200 dark:border-gray-700 rounded-lg">
+                        <div class="flex items-center gap-2 mb-2 text-sm text-gray-500 dark:text-gray-400">
+                            <label for="badgeMinutes">Minutes per game</label>
+                            <input id="badgeMinutes" type="number" min="1" max="120"
+                                v-model.number="badgeMinutesPerGame" :disabled="isBadgeRotating"
+                                class="w-16 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-md dark:bg-gray-700 dark:text-white" />
+                        </div>
+                        <button @click="isBadgeRotating ? stopBadgeRotation() : startBadgeRotation()"
+                            class="w-full py-2 rounded-lg text-white"
+                            :class="isBadgeRotating ? 'bg-red-600 hover:bg-red-700' : 'bg-emerald-600 hover:bg-emerald-700'">
+                            {{ isBadgeRotating ? 'Stop Game Badge' : 'Game Badge' }}
+                        </button>
+                        <div v-if="isBadgeRotating" class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                            Now playing: <span class="text-green-500">{{ badgeCurrentGame }}</span>
+                            · games done: {{ badgePlayedCount }}
+                        </div>
+                        <div v-else class="mt-2 text-xs text-gray-500 dark:text-gray-400">
+                            Uses your games list (auto-adds random games up to {{ BADGE_MIN_GAMES }}).
+                        </div>
+                    </div>
 
                     <!-- <button :disabled="!canCreateDummyGame(selectedGame)" @click="createDummyGame(selectedGame)" class="w-full py-2 rounded-lg"
                         :class="[
